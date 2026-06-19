@@ -32,6 +32,7 @@ from gui import (
     FilterPanel,
     ResultsTable,
     HistoryTab,
+    WatchlistTab,
     SettingsTab,
     _NumericItem,
 )
@@ -338,3 +339,102 @@ class TestSettingsTab:
         tab._save()
         # Delays checkbox unchecked by default → no_delay=True
         assert received[0].no_delay is True
+
+    def test_client_fields_present(self, app):
+        tab = SettingsTab(on_save=lambda cfg, k, d: None)
+        assert hasattr(tab, "_client_type")
+        assert hasattr(tab, "_client_url")
+        assert hasattr(tab, "_client_user")
+        assert hasattr(tab, "_client_pass")
+
+    def test_get_client_config_default(self, app):
+        tab = SettingsTab(on_save=lambda cfg, k, d: None)
+        client_type, url, user, pw = tab.get_client_config()
+        assert client_type == "none"
+        assert url == ""
+        assert user == ""
+        assert pw == ""
+
+    def test_get_client_config_qbittorrent(self, app):
+        tab = SettingsTab(on_save=lambda cfg, k, d: None)
+        tab._client_type.setCurrentText("qBittorrent")
+        tab._client_url.setText("http://localhost:8080")
+        client_type, url, _, _ = tab.get_client_config()
+        assert client_type == "qbittorrent"
+        assert url == "http://localhost:8080"
+
+    def test_rss_interval_default(self, app):
+        tab = SettingsTab(on_save=lambda cfg, k, d: None)
+        assert tab._rss_interval.value() == 15
+
+
+# ── WatchlistTab ──────────────────────────────────────────────────────────────
+
+class TestWatchlistTab:
+    def test_refresh_loads_entries(self, app, tmp_path):
+        from search_engine import Watchlist
+        import search_engine as _se
+        old_wl = _se.WATCHLIST
+        _se.WATCHLIST = Watchlist(db_path=str(tmp_path / "wl.db"))
+        _se.WATCHLIST.add(Torrent("a" * 40, "Ubuntu", seeds=100, size=1024**3))
+        _se.WATCHLIST.add(Torrent("b" * 40, "Debian", seeds=50))
+
+        from gui import WatchlistTab
+        cfg = PrivacyConfig(no_delay=True)
+        tab = WatchlistTab(cfg_getter=lambda: cfg, status_fn=lambda m, ms=0: None)
+        tab.refresh()
+        assert tab._table.rowCount() == 2
+
+        _se.WATCHLIST.close()
+        _se.WATCHLIST = old_wl
+
+    def test_refresh_empty(self, app, tmp_path):
+        from search_engine import Watchlist
+        import search_engine as _se
+        old_wl = _se.WATCHLIST
+        _se.WATCHLIST = Watchlist(db_path=str(tmp_path / "wl2.db"))
+
+        from gui import WatchlistTab
+        cfg = PrivacyConfig(no_delay=True)
+        tab = WatchlistTab(cfg_getter=lambda: cfg, status_fn=lambda m, ms=0: None)
+        tab.refresh()
+        assert tab._table.rowCount() == 0
+
+        _se.WATCHLIST.close()
+        _se.WATCHLIST = old_wl
+
+    def test_remove_selected(self, app, tmp_path):
+        from search_engine import Watchlist
+        import search_engine as _se
+        old_wl = _se.WATCHLIST
+        _se.WATCHLIST = Watchlist(db_path=str(tmp_path / "wl3.db"))
+        _se.WATCHLIST.add(Torrent("a" * 40, "Ubuntu", seeds=100))
+
+        from gui import WatchlistTab
+        cfg = PrivacyConfig(no_delay=True)
+        tab = WatchlistTab(cfg_getter=lambda: cfg, status_fn=lambda m, ms=0: None)
+        tab.refresh()
+        tab._table.selectRow(0)
+        tab._remove_selected()
+        assert tab._table.rowCount() == 0
+        assert _se.WATCHLIST.list_all() == []
+
+        _se.WATCHLIST.close()
+        _se.WATCHLIST = old_wl
+
+
+# ── ResultsTable context menu entries ────────────────────────────────────────
+
+class TestResultsTableContextMenuEntries:
+    def test_context_menu_has_watchlist_and_send(self, app):
+        cfg = PrivacyConfig(no_delay=True)
+        table = ResultsTable(
+            status_fn=lambda msg, ms=0: None,
+            cfg_getter=lambda: cfg,
+        )
+        table.populate([Torrent("a" * 40, "Ubuntu", seeds=100)])
+        # Check that the context menu action labels are defined by inspecting the method
+        import inspect
+        src = inspect.getsource(table._on_context_menu)
+        assert "Zu Favoriten hinzufügen" in src
+        assert "An Torrent-Client senden" in src

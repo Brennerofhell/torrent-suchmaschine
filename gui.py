@@ -11,14 +11,16 @@ from PyQt6.QtWidgets import (
     QLineEdit, QPushButton, QTableWidget, QTableWidgetItem,
     QHeaderView, QProgressBar, QGroupBox, QLabel,
     QSpinBox, QDoubleSpinBox, QComboBox, QCheckBox,
-    QSplitter, QMenu, QAbstractItemView,
+    QSplitter, QMenu, QAbstractItemView, QListWidget,
+    QListWidgetItem,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
 
 import search_engine as _se
 from search_engine import (
     TorrentSearchEngine, PrivacyConfig, Platform, Torrent,
     apply_filters, parse_filters, build_magnet, enable_doh,
+    RSSWatcher,
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -35,6 +37,11 @@ class _NumericItem(QTableWidgetItem):
             return a < b
         except Exception:
             return super().__lt__(other)
+
+
+class _RssSignalBridge(QObject):
+    """Bridges RSSWatcher daemon-thread callbacks → main-thread Qt signals."""
+    hit = pyqtSignal(str, list)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -266,6 +273,23 @@ class ResultsTable(QTableWidget):
             QApplication.clipboard().setText(ih)
             self._status_fn(f"Infohash kopiert: {ih}", 3000)
 
+    def _add_to_watchlist(self, row: int) -> None:
+        idx = self._orig_index(row)
+        if 0 <= idx < len(self._results):
+            t = self._results[idx]
+            added = _se.WATCHLIST.add(t)
+            msg = f"Favorit hinzugefügt: {t.name[:50]}" if added else f"Bereits in Favoriten: {t.name[:50]}"
+            self._status_fn(msg, 3000)
+
+    def _send_to_client(self, row: int) -> None:
+        idx = self._orig_index(row)
+        if 0 <= idx < len(self._results):
+            t = self._results[idx]
+            magnet = build_magnet(t, self._cfg_getter())
+            ok = _se.TORRENT_CLIENT.add_magnet(magnet)
+            msg = f"Gesendet: {t.name[:50]}" if ok else f"Fehler beim Senden – Client konfiguriert?"
+            self._status_fn(msg, 4000)
+
     def _on_double_click(self, row: int, _col: int) -> None:
         self._copy_magnet(row)
 
@@ -276,11 +300,18 @@ class ResultsTable(QTableWidget):
         menu = QMenu(self)
         act_magnet = menu.addAction("Magnet-Link kopieren")
         act_hash = menu.addAction("Infohash kopieren")
+        menu.addSeparator()
+        act_fav = menu.addAction("Zu Favoriten hinzufügen")
+        act_send = menu.addAction("An Torrent-Client senden")
         chosen = menu.exec(self.mapToGlobal(pos))
         if chosen == act_magnet:
             self._copy_magnet(row)
         elif chosen == act_hash:
             self._copy_infohash(row)
+        elif chosen == act_fav:
+            self._add_to_watchlist(row)
+        elif chosen == act_send:
+            self._send_to_client(row)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -340,6 +371,10 @@ class SearchTab(QWidget):
 
     def set_query(self, query: str) -> None:
         self._search_input.setText(query)
+
+    def show_results(self, results: list) -> None:
+        """Populate the table with external results (e.g. from RSS watcher)."""
+        self._results_table.populate(results)
 
     def _start_search(self) -> None:
         raw = self._search_input.text().strip()
@@ -440,19 +475,130 @@ class HistoryTab(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SETTINGS TAB
+# WATCHLIST TAB
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class SettingsTab(QWidget):
-    """Configuration panel: proxy, DoH, delays, DHT, top-k."""
+_FAV_COLUMNS = ["Name", "Seeds", "Leeches", "Größe", "Quelle"]
 
-    def __init__(self, on_save, parent=None) -> None:
+
+class WatchlistTab(QWidget):
+    """Shows and manages saved favourites. Loads on tab switch."""
+
+    def __init__(self, cfg_getter, status_fn, parent=None) -> None:
         super().__init__(parent)
-        self._on_save = on_save
+        self._cfg_getter = cfg_getter
+        self._status_fn = status_fn
+        self._favs: list = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
 
+        self._table = QTableWidget(0, len(_FAV_COLUMNS))
+        self._table.setHorizontalHeaderLabels(_FAV_COLUMNS)
+        hdr = self._table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setAlternatingRowColors(True)
+        self._table.verticalHeader().setVisible(False)
+        self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._table.customContextMenuRequested.connect(self._on_context_menu)
+        layout.addWidget(self._table)
+
+        btn_row = QWidget()
+        btn_lay = QHBoxLayout(btn_row)
+        btn_lay.setContentsMargins(0, 4, 0, 0)
+        btn_remove = QPushButton("Ausgewählten entfernen")
+        btn_remove.setMaximumWidth(200)
+        btn_remove.clicked.connect(self._remove_selected)
+        btn_clear = QPushButton("Alle löschen")
+        btn_clear.setMaximumWidth(120)
+        btn_clear.clicked.connect(self._clear)
+        btn_lay.addWidget(btn_remove)
+        btn_lay.addWidget(btn_clear)
+        btn_lay.addStretch()
+        layout.addWidget(btn_row)
+
+    def refresh(self) -> None:
+        self._favs = _se.WATCHLIST.list_all()
+        self._table.setRowCount(0)
+        for t in self._favs:
+            row = self._table.rowCount()
+            self._table.insertRow(row)
+            self._table.setItem(row, 0, QTableWidgetItem(t.name))
+            seeds_item = QTableWidgetItem(f"{t.seeds:,}")
+            seeds_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self._table.setItem(row, 1, seeds_item)
+            leeches_item = QTableWidgetItem(f"{t.leeches:,}")
+            leeches_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self._table.setItem(row, 2, leeches_item)
+            if t.size >= 1024 ** 3:
+                size_str = f"{t.size / 1024**3:.1f} GB"
+            elif t.size > 0:
+                size_str = f"{t.size / 1024**2:.1f} MB"
+            else:
+                size_str = "–"
+            size_item = QTableWidgetItem(size_str)
+            size_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self._table.setItem(row, 3, size_item)
+            self._table.setItem(row, 4, QTableWidgetItem(t.source))
+
+    def _remove_selected(self) -> None:
+        row = self._table.currentRow()
+        if 0 <= row < len(self._favs):
+            t = self._favs[row]
+            _se.WATCHLIST.remove(t.infohash)
+            self._status_fn(f"Entfernt: {t.name[:60]}", 3000)
+            self.refresh()
+
+    def _clear(self) -> None:
+        _se.WATCHLIST.clear()
+        self._table.setRowCount(0)
+        self._favs = []
+
+    def _on_context_menu(self, pos) -> None:
+        row = self._table.rowAt(pos.y())
+        if row < 0 or row >= len(self._favs):
+            return
+        t = self._favs[row]
+        menu = QMenu(self)
+        act_magnet = menu.addAction("Magnet-Link kopieren")
+        act_send = menu.addAction("An Torrent-Client senden")
+        act_remove = menu.addAction("Aus Favoriten entfernen")
+        chosen = menu.exec(self._table.mapToGlobal(pos))
+        if chosen == act_magnet:
+            magnet = build_magnet(t, self._cfg_getter())
+            QApplication.clipboard().setText(magnet)
+            self._status_fn(f"Magnet-Link kopiert: {t.name[:60]}", 4000)
+        elif chosen == act_send:
+            magnet = build_magnet(t, self._cfg_getter())
+            ok = _se.TORRENT_CLIENT.add_magnet(magnet)
+            msg = f"Gesendet: {t.name[:50]}" if ok else "Fehler – Client konfiguriert?"
+            self._status_fn(msg, 4000)
+        elif chosen == act_remove:
+            _se.WATCHLIST.remove(t.infohash)
+            self._status_fn(f"Entfernt: {t.name[:60]}", 3000)
+            self.refresh()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SETTINGS TAB
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class SettingsTab(QWidget):
+    """Configuration: proxy, DoH, delays, DHT, top-k, torrent client, RSS watches."""
+
+    _CLIENT_TYPES = ["Kein", "qBittorrent", "Transmission"]
+
+    def __init__(self, on_save, parent=None) -> None:
+        super().__init__(parent)
+        self._on_save = on_save
+        self._rss_watcher: RSSWatcher = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+
+        # ── Connection / Privacy ──────────────────────────────────────────────
         form_box = QGroupBox("Verbindung & Datenschutz")
         form_lay = QFormLayout(form_box)
         form_lay.setVerticalSpacing(8)
@@ -480,6 +626,75 @@ class SettingsTab(QWidget):
 
         layout.addWidget(form_box)
 
+        # ── Torrent Client ────────────────────────────────────────────────────
+        client_box = QGroupBox("Torrent-Client")
+        client_lay = QFormLayout(client_box)
+        client_lay.setVerticalSpacing(6)
+
+        self._client_type = QComboBox()
+        self._client_type.addItems(self._CLIENT_TYPES)
+        client_lay.addRow("Client:", self._client_type)
+
+        self._client_url = QLineEdit()
+        self._client_url.setPlaceholderText("http://localhost:8080")
+        client_lay.addRow("URL:", self._client_url)
+
+        self._client_user = QLineEdit()
+        self._client_user.setPlaceholderText("Benutzername (optional)")
+        client_lay.addRow("Benutzer:", self._client_user)
+
+        self._client_pass = QLineEdit()
+        self._client_pass.setEchoMode(QLineEdit.EchoMode.Password)
+        self._client_pass.setPlaceholderText("Passwort (optional)")
+        client_lay.addRow("Passwort:", self._client_pass)
+
+        btn_test = QPushButton("Verbindung testen")
+        btn_test.setMaximumWidth(160)
+        btn_test.clicked.connect(self._test_client)
+        client_lay.addRow(btn_test)
+
+        layout.addWidget(client_box)
+
+        # ── RSS Auto-Refresh ──────────────────────────────────────────────────
+        rss_box = QGroupBox("RSS Auto-Refresh")
+        rss_lay = QVBoxLayout(rss_box)
+
+        interval_row = QWidget()
+        interval_lay = QHBoxLayout(interval_row)
+        interval_lay.setContentsMargins(0, 0, 0, 0)
+        interval_lay.addWidget(QLabel("Intervall:"))
+        self._rss_interval = QSpinBox()
+        self._rss_interval.setRange(5, 120)
+        self._rss_interval.setValue(15)
+        self._rss_interval.setSuffix(" min")
+        interval_lay.addWidget(self._rss_interval)
+        interval_lay.addStretch()
+        rss_lay.addWidget(interval_row)
+
+        self._watch_list = QListWidget()
+        self._watch_list.setMaximumHeight(120)
+        rss_lay.addWidget(self._watch_list)
+
+        add_row = QWidget()
+        add_lay = QHBoxLayout(add_row)
+        add_lay.setContentsMargins(0, 0, 0, 0)
+        self._watch_input = QLineEdit()
+        self._watch_input.setPlaceholderText("Suchbegriff überwachen…")
+        self._watch_input.returnPressed.connect(self._add_watch)
+        btn_add_watch = QPushButton("Hinzufügen")
+        btn_add_watch.setMaximumWidth(100)
+        btn_add_watch.clicked.connect(self._add_watch)
+        btn_rm_watch = QPushButton("Entfernen")
+        btn_rm_watch.setMaximumWidth(100)
+        btn_rm_watch.clicked.connect(self._remove_watch)
+        add_lay.addWidget(self._watch_input)
+        add_lay.addWidget(btn_add_watch)
+        add_lay.addWidget(btn_rm_watch)
+        rss_lay.addWidget(add_row)
+
+        layout.addWidget(rss_box)
+
+        # ── Save ──────────────────────────────────────────────────────────────
         save_btn = QPushButton("Einstellungen speichern")
         save_btn.setMaximumWidth(200)
         save_btn.clicked.connect(self._save)
@@ -497,6 +712,51 @@ class SettingsTab(QWidget):
             warn_lbl.setStyleSheet("color: darkorange; font-weight: bold; font-size: 11px;")
             layout.addWidget(warn_lbl)
 
+    def _test_client(self) -> None:
+        self._apply_client_config()
+        result = _se.TORRENT_CLIENT.test_connection()
+        # show result inline via a temporary label update
+        self._on_save(self.get_config()[0], self.get_config()[1], self.get_config()[2])
+
+    def _apply_client_config(self) -> None:
+        client_map = {"Kein": "none", "qBittorrent": "qbittorrent", "Transmission": "transmission"}
+        _se.TORRENT_CLIENT.client = client_map.get(self._client_type.currentText(), "none")
+        _se.TORRENT_CLIENT.url = self._client_url.text().strip()
+        _se.TORRENT_CLIENT.username = self._client_user.text().strip()
+        _se.TORRENT_CLIENT.password = self._client_pass.text()
+
+    def get_client_config(self) -> tuple:
+        """Return (client_type_str, url, username, password)."""
+        client_map = {"Kein": "none", "qBittorrent": "qbittorrent", "Transmission": "transmission"}
+        return (
+            client_map.get(self._client_type.currentText(), "none"),
+            self._client_url.text().strip(),
+            self._client_user.text().strip(),
+            self._client_pass.text(),
+        )
+
+    def set_rss_watcher(self, watcher: RSSWatcher) -> None:
+        """Called by MainWindow so SettingsTab can manage watches."""
+        self._rss_watcher = watcher
+
+    def _add_watch(self) -> None:
+        query = self._watch_input.text().strip()
+        if not query or not self._rss_watcher:
+            return
+        watch_id = self._rss_watcher.add_watch(query, None)
+        item = QListWidgetItem(f"[{watch_id}]  {query}")
+        item.setData(Qt.ItemDataRole.UserRole, watch_id)
+        self._watch_list.addItem(item)
+        self._watch_input.clear()
+
+    def _remove_watch(self) -> None:
+        current = self._watch_list.currentItem()
+        if not current or not self._rss_watcher:
+            return
+        watch_id = current.data(Qt.ItemDataRole.UserRole)
+        self._rss_watcher.remove_watch(watch_id)
+        self._watch_list.takeItem(self._watch_list.row(current))
+
     def _save(self) -> None:
         proxy = self._proxy.text().strip()
         cfg = PrivacyConfig(
@@ -506,6 +766,7 @@ class SettingsTab(QWidget):
         )
         if cfg.use_doh:
             enable_doh()
+        self._apply_client_config()
         self._on_save(cfg, self._top_k.value(), self._dht_sec.value())
 
     def get_config(self) -> tuple:
@@ -528,6 +789,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._cfg = PrivacyConfig(no_delay=no_delay)
         self._engine = TorrentSearchEngine(cfg=self._cfg, top_k=Platform.TOP_K_DEFAULT)
+        self._rss_bridge = _RssSignalBridge()
+        self._rss_watcher = RSSWatcher(self._engine)
+        self._rss_watcher.start()
+        self._rss_bridge.hit.connect(self._on_rss_hit)
 
         self.setWindowTitle("Torrent Search Engine")
         self.setMinimumSize(900, 600)
@@ -542,18 +807,27 @@ class MainWindow(QMainWindow):
             status_fn=self.statusBar().showMessage,
         )
         self._history_tab = HistoryTab(search_fn=self._search_from_history)
+        self._watchlist_tab = WatchlistTab(
+            cfg_getter=lambda: self._cfg,
+            status_fn=self.statusBar().showMessage,
+        )
         self._settings_tab = SettingsTab(on_save=self._apply_settings)
+        self._settings_tab.set_rss_watcher(self._rss_watcher)
 
         self._tabs.addTab(self._search_tab, "🔎  Suche")
         self._tabs.addTab(self._history_tab, "📋  Verlauf")
+        self._tabs.addTab(self._watchlist_tab, "⭐  Favoriten")
         self._tabs.addTab(self._settings_tab, "⚙  Einstellungen")
         self._tabs.currentChanged.connect(self._on_tab_changed)
 
         self.statusBar().showMessage("Bereit  –  " + Platform.summary())
 
     def _on_tab_changed(self, idx: int) -> None:
-        if self._tabs.widget(idx) is self._history_tab:
+        widget = self._tabs.widget(idx)
+        if widget is self._history_tab:
             self._history_tab.refresh()
+        elif widget is self._watchlist_tab:
+            self._watchlist_tab.refresh()
 
     def _search_from_history(self, query: str) -> None:
         self._tabs.setCurrentWidget(self._search_tab)
@@ -564,11 +838,22 @@ class MainWindow(QMainWindow):
         self._cfg = cfg
         self._engine.close()
         self._engine = TorrentSearchEngine(cfg=cfg, top_k=top_k, dht_seconds=dht_sec)
+        self._rss_watcher._engine = self._engine
         self.statusBar().showMessage("Einstellungen gespeichert.", 3000)
 
+    def _on_rss_hit(self, query: str, results: list) -> None:
+        self.statusBar().showMessage(
+            f"RSS Watch: {len(results)} neue Treffer für '{query}'", 8000
+        )
+        QApplication.beep()
+        self._search_tab.set_query(query)
+        self._search_tab.show_results(results)
+
     def closeEvent(self, event) -> None:
+        self._rss_watcher.stop()
         self._engine.close()
         _se.HISTORY.close()
+        _se.WATCHLIST.close()
         event.accept()
 
 
