@@ -320,6 +320,15 @@ CREATE TABLE IF NOT EXISTS results (
     source TEXT,
     ts REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS favorites (
+    infohash  TEXT PRIMARY KEY,
+    name      TEXT NOT NULL,
+    size      INTEGER DEFAULT 0,
+    seeds     INTEGER DEFAULT 0,
+    leeches   INTEGER DEFAULT 0,
+    source    TEXT DEFAULT '',
+    added_ts  REAL NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_results_query ON results(query);
 """
 
@@ -434,6 +443,303 @@ class SearchHistory:
 
 
 HISTORY = SearchHistory()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WATCHLIST / FAVOURITES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class Watchlist:
+    """Persistent favourites stored in the same SQLite DB as SearchHistory."""
+
+    def __init__(self, db_path: str = "~/.torrent_search.db") -> None:
+        self._path = os.path.expanduser(db_path)
+        self._lock = threading.Lock()
+        self._conn: _sqlite3.Connection = None
+        self._open()
+
+    def _open(self) -> None:
+        try:
+            self._conn = _sqlite3.connect(self._path, check_same_thread=False)
+            self._conn.executescript(_HISTORY_SCHEMA)
+            self._conn.commit()
+        except Exception:
+            self._conn = None
+
+    def add(self, t: "Torrent") -> bool:
+        """Return True if newly added, False if already present."""
+        if not self._conn or not t.infohash:
+            return False
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO favorites "
+                    "(infohash, name, size, seeds, leeches, source, added_ts) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (t.infohash, t.name, t.size, t.seeds, t.leeches, t.source, time.time()),
+                )
+                changed = self._conn.total_changes
+                self._conn.commit()
+                return self._conn.total_changes > changed or self._conn.total_changes > 0
+            except Exception:
+                return False
+
+    def remove(self, infohash: str) -> bool:
+        if not self._conn:
+            return False
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "DELETE FROM favorites WHERE infohash = ?", (infohash.lower(),)
+                )
+                self._conn.commit()
+                return True
+            except Exception:
+                return False
+
+    def list_all(self) -> list:
+        if not self._conn:
+            return []
+        with self._lock:
+            try:
+                cur = self._conn.execute(
+                    "SELECT infohash, name, size, seeds, leeches, source "
+                    "FROM favorites ORDER BY added_ts DESC"
+                )
+                return [
+                    Torrent(r[0], r[1], r[2] or 0, r[3] or 0, r[4] or 0, r[5] or "")
+                    for r in cur.fetchall()
+                ]
+            except Exception:
+                return []
+
+    def is_favorite(self, infohash: str) -> bool:
+        if not self._conn:
+            return False
+        with self._lock:
+            try:
+                cur = self._conn.execute(
+                    "SELECT 1 FROM favorites WHERE infohash = ?", (infohash.lower(),)
+                )
+                return cur.fetchone() is not None
+            except Exception:
+                return False
+
+    def clear(self) -> None:
+        if not self._conn:
+            return
+        with self._lock:
+            try:
+                self._conn.execute("DELETE FROM favorites")
+                self._conn.commit()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        if self._conn:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
+
+WATCHLIST = Watchlist()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TORRENT CLIENT API
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TorrentClientAPI:
+    """Send magnet links to qBittorrent or Transmission via their REST APIs."""
+
+    SUPPORTED = ("qbittorrent", "transmission", "none")
+
+    def __init__(
+        self,
+        client: str = "none",
+        url: str = "",
+        username: str = "",
+        password: str = "",
+    ) -> None:
+        self.client = client.lower()
+        self.url = url.rstrip("/")
+        self.username = username
+        self.password = password
+        self._session = requests.Session()
+
+    def add_magnet(self, magnet: str) -> bool:
+        if self.client == "qbittorrent":
+            return self._add_qbittorrent(magnet)
+        if self.client == "transmission":
+            return self._add_transmission(magnet)
+        return False
+
+    def test_connection(self) -> str:
+        """Return 'OK' or an error description."""
+        if self.client == "none" or not self.url:
+            return "Kein Client konfiguriert"
+        try:
+            if self.client == "qbittorrent":
+                resp = self._session.get(
+                    f"{self.url}/api/v2/app/version", timeout=5
+                )
+                if resp.status_code == 200:
+                    return "OK"
+                return f"HTTP {resp.status_code}"
+            if self.client == "transmission":
+                resp = self._session.get(
+                    f"{self.url}/transmission/rpc", timeout=5
+                )
+                if resp.status_code in (200, 409):
+                    return "OK"
+                return f"HTTP {resp.status_code}"
+        except Exception as exc:
+            return str(exc)
+        return "Unbekannter Client"
+
+    def _add_qbittorrent(self, magnet: str) -> bool:
+        try:
+            # Login
+            if self.username:
+                self._session.post(
+                    f"{self.url}/api/v2/auth/login",
+                    data={"username": self.username, "password": self.password},
+                    timeout=5,
+                )
+            resp = self._session.post(
+                f"{self.url}/api/v2/torrents/add",
+                data={"urls": magnet},
+                timeout=10,
+            )
+            return resp.status_code == 200 and resp.text.strip() != "Fails."
+        except Exception:
+            return False
+
+    def _add_transmission(self, magnet: str) -> bool:
+        rpc_url = f"{self.url}/transmission/rpc"
+        try:
+            # First request gets the session token via 409
+            r1 = self._session.get(rpc_url, timeout=5)
+            session_id = r1.headers.get("X-Transmission-Session-Id", "")
+            headers = {"X-Transmission-Session-Id": session_id}
+            payload = {
+                "method": "torrent-add",
+                "arguments": {"filename": magnet},
+            }
+            resp = self._session.post(
+                rpc_url,
+                json=payload,
+                headers=headers,
+                auth=(self.username, self.password) if self.username else None,
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                result = resp.json().get("result", "")
+                return result == "success"
+            return False
+        except Exception:
+            return False
+
+
+TORRENT_CLIENT = TorrentClientAPI()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RSS WATCHER (Auto-Refresh)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import uuid as _uuid
+
+
+class RSSWatcher:
+    """Polls watched queries in the background and calls back on new results."""
+
+    def __init__(self, engine: "TorrentSearchEngine", interval_min: int = 15) -> None:
+        self._engine = engine
+        self.interval_min = interval_min
+        self._watches: dict = {}      # watch_id -> {query, callback, seen: set, hits: int}
+        self._lock = threading.Lock()
+        self._thread: threading.Thread = None
+        self._running = False
+
+    def add_watch(self, query: str, callback) -> str:
+        """Register a query. callback(query, new_torrents) is called on new hits."""
+        watch_id = _uuid.uuid4().hex[:8]
+        with self._lock:
+            self._watches[watch_id] = {
+                "query": query,
+                "callback": callback,
+                "seen": set(),
+                "hits": 0,
+                "last_check": 0.0,
+            }
+        return watch_id
+
+    def remove_watch(self, watch_id: str) -> bool:
+        with self._lock:
+            return self._watches.pop(watch_id, None) is not None
+
+    def list_watches(self) -> list:
+        with self._lock:
+            return [
+                {
+                    "id": wid,
+                    "query": w["query"],
+                    "last_check": w["last_check"],
+                    "hits": w["hits"],
+                }
+                for wid, w in self._watches.items()
+            ]
+
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._poll_loop, name="rss-watcher", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    def _poll_loop_once(self) -> None:
+        """Run one poll iteration (for testing and for the background loop)."""
+        interval_s = self.interval_min * 60
+        with self._lock:
+            watches_snapshot = dict(self._watches)
+
+        for watch_id, watch in watches_snapshot.items():
+            now = time.monotonic()
+            if now - watch["last_check"] < interval_s:
+                continue
+            try:
+                results = self._engine.search(watch["query"])
+                new_results = [
+                    t for t in results if t.infohash not in watch["seen"]
+                ]
+                with self._lock:
+                    if watch_id in self._watches:
+                        self._watches[watch_id]["last_check"] = now
+                        for t in new_results:
+                            self._watches[watch_id]["seen"].add(t.infohash)
+                        self._watches[watch_id]["hits"] += len(new_results)
+                if new_results and watch["callback"]:
+                    try:
+                        watch["callback"](watch["query"], new_results)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+    def _poll_loop(self) -> None:
+        while self._running:
+            self._poll_loop_once()
+            time.sleep(10)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1286,11 +1592,17 @@ def run_cli(args) -> None:
     if warn:
         print(f"  {warn}")
     print("=" * 60)
-    print("  Befehle: privacy | cache | ram | history | history clear | q")
+    print("  Befehle: privacy | cache | ram | history | history clear")
+    print("  Favoriten:  fav <N> | favs | unfav <N>")
+    print("  Client:     client qbittorrent <URL> | client transmission <URL>")
+    print("              send <N> | send fav <N>")
+    print("  RSS-Watch:  watch <Suchbegriff> | watches | unwatch <ID>")
     print("  Filter-Syntax: 'ubuntu seeds>50 size<2GB source=apibay'")
-    print("  Nummer eingeben nach Suche für Magnet-Link\n")
+    print("  Nummer eingeben nach Suche für Magnet-Link  |  q = Beenden\n")
 
     last_results: list = []
+    last_favs: list = []
+    rss_watcher: RSSWatcher = None
 
     while True:
         try:
@@ -1342,6 +1654,129 @@ def run_cli(args) -> None:
                 print("psutil nicht installiert")
             continue
 
+        # ── Favourites ──────────────────────────────────────────────────────
+        if query.lower() == "favs":
+            last_favs = WATCHLIST.list_all()
+            if not last_favs:
+                print("  Keine Favoriten gespeichert.")
+            else:
+                print(f"\n  {len(last_favs)} Favoriten:\n")
+                for i, t in enumerate(last_favs, 1):
+                    size_str = f"{t.size/(1024*1024):.1f}MB" if t.size else "?MB"
+                    print(f"  {i:3d}. [{t.source:15s}] {t.name[:55]:<55s}  S:{t.seeds:<5d} {size_str}")
+                print()
+            continue
+
+        if query.lower().startswith("fav "):
+            num_str = query[4:].strip()
+            if num_str.isdigit():
+                idx = int(num_str) - 1
+                if 0 <= idx < len(last_results):
+                    added = WATCHLIST.add(last_results[idx])
+                    name = last_results[idx].name[:50]
+                    print(f"  {'Hinzugefügt' if added else 'Bereits vorhanden'}: {name}")
+                else:
+                    print(f"  Ungültige Nummer (1–{len(last_results)})")
+            else:
+                print("  Syntax: fav <N>")
+            continue
+
+        if query.lower().startswith("unfav "):
+            num_str = query[6:].strip()
+            if num_str.isdigit():
+                idx = int(num_str) - 1
+                if 0 <= idx < len(last_favs):
+                    WATCHLIST.remove(last_favs[idx].infohash)
+                    print(f"  Entfernt: {last_favs[idx].name[:50]}")
+                    last_favs = WATCHLIST.list_all()
+                else:
+                    print(f"  Ungültige Nummer (1–{len(last_favs)}) – erst 'favs' eingeben")
+            else:
+                print("  Syntax: unfav <N>")
+            continue
+
+        # ── Torrent Client ───────────────────────────────────────────────────
+        if query.lower().startswith("client "):
+            parts = query.split(maxsplit=2)
+            if len(parts) >= 3 and parts[1].lower() in TorrentClientAPI.SUPPORTED:
+                TORRENT_CLIENT.client = parts[1].lower()
+                TORRENT_CLIENT.url = parts[2]
+                print(f"  Client gesetzt: {TORRENT_CLIENT.client} → {TORRENT_CLIENT.url}")
+            else:
+                print(f"  Syntax: client qbittorrent <URL> | client transmission <URL>")
+            continue
+
+        if query.lower().startswith("send fav "):
+            num_str = query[9:].strip()
+            if num_str.isdigit():
+                idx = int(num_str) - 1
+                if 0 <= idx < len(last_favs):
+                    t = last_favs[idx]
+                    magnet = build_magnet(t, cfg)
+                    ok = TORRENT_CLIENT.add_magnet(magnet)
+                    print(f"  {'Gesendet' if ok else 'Fehler beim Senden'}: {t.name[:50]}")
+                else:
+                    print(f"  Ungültige Nummer – erst 'favs' eingeben")
+            else:
+                print("  Syntax: send fav <N>")
+            continue
+
+        if query.lower().startswith("send "):
+            num_str = query[5:].strip()
+            if num_str.isdigit():
+                idx = int(num_str) - 1
+                if 0 <= idx < len(last_results):
+                    t = last_results[idx]
+                    magnet = build_magnet(t, cfg)
+                    ok = TORRENT_CLIENT.add_magnet(magnet)
+                    print(f"  {'Gesendet' if ok else 'Fehler beim Senden'}: {t.name[:50]}")
+                else:
+                    print(f"  Ungültige Nummer (1–{len(last_results)})")
+            else:
+                print("  Syntax: send <N>")
+            continue
+
+        # ── RSS Watcher ──────────────────────────────────────────────────────
+        if query.lower() == "watches":
+            if rss_watcher is None or not rss_watcher.list_watches():
+                print("  Keine aktiven Watches.")
+            else:
+                print(f"\n  Aktive Watches:\n")
+                for w in rss_watcher.list_watches():
+                    last = time.strftime("%H:%M", time.localtime(w["last_check"])) if w["last_check"] else "–"
+                    print(f"  [{w['id']}]  {w['query']:<40s}  Letzter Check: {last}  Neue Treffer: {w['hits']}")
+                print()
+            continue
+
+        if query.lower().startswith("watch "):
+            watch_query = query[6:].strip()
+            if watch_query:
+                if rss_watcher is None:
+                    rss_watcher = RSSWatcher(engine)
+                    rss_watcher.start()
+
+                def _cli_callback(q, new_torrents, _wq=watch_query):
+                    print(f"\n  [Watch] {len(new_torrents)} neue Treffer für '{_wq}':")
+                    for t in new_torrents[:5]:
+                        print(f"    • {t.name[:60]}")
+                    if len(new_torrents) > 5:
+                        print(f"    … und {len(new_torrents) - 5} weitere")
+                    print()
+
+                watch_id = rss_watcher.add_watch(watch_query, _cli_callback)
+                print(f"  Watch gestartet [{watch_id}]: '{watch_query}' – Intervall: {rss_watcher.interval_min} Min.")
+            else:
+                print("  Syntax: watch <Suchbegriff>")
+            continue
+
+        if query.lower().startswith("unwatch "):
+            watch_id = query[8:].strip()
+            if rss_watcher and rss_watcher.remove_watch(watch_id):
+                print(f"  Watch [{watch_id}] entfernt.")
+            else:
+                print(f"  Watch [{watch_id}] nicht gefunden.")
+            continue
+
         # Check if input is a number -> show magnet link
         if query.isdigit():
             idx = int(query) - 1
@@ -1380,6 +1815,8 @@ def run_cli(args) -> None:
                   f"S:{t.seeds:<5d} L:{t.leeches:<5d} {size_str}")
         print("\n  (Nummer eingeben für Magnet-Link)\n")
 
+    if rss_watcher:
+        rss_watcher.stop()
     engine.close()
     HISTORY.close()
 

@@ -16,6 +16,9 @@ from search_engine import (
     PrivacyConfig,
     ResultCache,
     SearchHistory,
+    Watchlist,
+    TorrentClientAPI,
+    RSSWatcher,
     top_k_stream,
     dedup_stream,
     fetch_text,
@@ -567,3 +570,217 @@ class TestFormatResults:
 
         assert call_count[0] == 2
         assert "hello" in result
+
+
+# ── Watchlist ─────────────────────────────────────────────────────────────────
+
+class TestWatchlist:
+    def _wl(self, tmp_path):
+        return Watchlist(db_path=str(tmp_path / "fav.db"))
+
+    def _t(self, ih="a" * 40, name="Test", seeds=100):
+        return Torrent(ih, name, size=1024 ** 3, seeds=seeds, leeches=10, source="apibay")
+
+    def test_add_and_is_favorite(self, tmp_path):
+        wl = self._wl(tmp_path)
+        t = self._t()
+        assert wl.add(t) is True
+        assert wl.is_favorite(t.infohash) is True
+        wl.close()
+
+    def test_no_duplicate(self, tmp_path):
+        wl = self._wl(tmp_path)
+        t = self._t()
+        wl.add(t)
+        result = wl.add(t)
+        # Second add should not raise, is_favorite still True
+        assert wl.is_favorite(t.infohash) is True
+        wl.close()
+
+    def test_remove(self, tmp_path):
+        wl = self._wl(tmp_path)
+        t = self._t()
+        wl.add(t)
+        wl.remove(t.infohash)
+        assert wl.is_favorite(t.infohash) is False
+        wl.close()
+
+    def test_list_all_sorted_by_added_ts(self, tmp_path):
+        wl = self._wl(tmp_path)
+        t1 = self._t("a" * 40, "First")
+        t2 = self._t("b" * 40, "Second")
+        wl.add(t1)
+        time.sleep(0.01)
+        wl.add(t2)
+        results = wl.list_all()
+        assert len(results) == 2
+        assert results[0].name == "Second"  # most recent first
+        wl.close()
+
+    def test_clear(self, tmp_path):
+        wl = self._wl(tmp_path)
+        wl.add(self._t("a" * 40))
+        wl.add(self._t("b" * 40, "B"))
+        wl.clear()
+        assert wl.list_all() == []
+        wl.close()
+
+    def test_not_favorite_after_remove(self, tmp_path):
+        wl = self._wl(tmp_path)
+        t = self._t()
+        wl.add(t)
+        wl.remove(t.infohash)
+        assert not wl.is_favorite(t.infohash)
+        wl.close()
+
+    def test_empty_infohash_not_added(self, tmp_path):
+        wl = self._wl(tmp_path)
+        t = Torrent("", "No hash", seeds=1)
+        result = wl.add(t)
+        assert result is False
+        wl.close()
+
+
+# ── TorrentClientAPI ─────────────────────────────────────────────────────────
+
+class TestTorrentClientAPI:
+    def test_none_client_add_returns_false(self):
+        api = TorrentClientAPI("none", "")
+        assert api.add_magnet("magnet:?xt=urn:btih:" + "a" * 40) is False
+
+    def test_none_client_test_connection(self):
+        api = TorrentClientAPI("none", "")
+        result = api.test_connection()
+        assert "kein" in result.lower() or "client" in result.lower()
+
+    def test_qbittorrent_success(self):
+        api = TorrentClientAPI("qbittorrent", "http://localhost:8080")
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = "Ok."
+        with patch.object(api._session, "post", return_value=mock_resp):
+            result = api.add_magnet("magnet:?xt=urn:btih:" + "a" * 40)
+        assert result is True
+
+    def test_qbittorrent_fails_response(self):
+        api = TorrentClientAPI("qbittorrent", "http://localhost:8080")
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = "Fails."
+        with patch.object(api._session, "post", return_value=mock_resp):
+            result = api.add_magnet("magnet:?xt=urn:btih:" + "a" * 40)
+        assert result is False
+
+    def test_transmission_success(self):
+        api = TorrentClientAPI("transmission", "http://localhost:9091")
+        mock_409 = MagicMock()
+        mock_409.status_code = 409
+        mock_409.headers = {"X-Transmission-Session-Id": "token123"}
+        mock_200 = MagicMock()
+        mock_200.status_code = 200
+        mock_200.json.return_value = {"result": "success"}
+        with patch.object(api._session, "get", return_value=mock_409):
+            with patch.object(api._session, "post", return_value=mock_200):
+                result = api.add_magnet("magnet:?xt=urn:btih:" + "a" * 40)
+        assert result is True
+
+    def test_transmission_failure(self):
+        api = TorrentClientAPI("transmission", "http://localhost:9091")
+        mock_409 = MagicMock()
+        mock_409.status_code = 409
+        mock_409.headers = {"X-Transmission-Session-Id": "token123"}
+        mock_200 = MagicMock()
+        mock_200.status_code = 200
+        mock_200.json.return_value = {"result": "error: duplicate torrent"}
+        with patch.object(api._session, "get", return_value=mock_409):
+            with patch.object(api._session, "post", return_value=mock_200):
+                result = api.add_magnet("magnet:?xt=urn:btih:" + "a" * 40)
+        assert result is False
+
+    def test_connection_error_returns_false(self):
+        api = TorrentClientAPI("qbittorrent", "http://localhost:8080")
+        with patch.object(api._session, "post", side_effect=Exception("connection refused")):
+            result = api.add_magnet("magnet:?xt=urn:btih:" + "a" * 40)
+        assert result is False
+
+    def test_qbittorrent_test_connection_ok(self):
+        api = TorrentClientAPI("qbittorrent", "http://localhost:8080")
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        with patch.object(api._session, "get", return_value=mock_resp):
+            result = api.test_connection()
+        assert result == "OK"
+
+    def test_transmission_test_connection_ok(self):
+        api = TorrentClientAPI("transmission", "http://localhost:9091")
+        mock_resp = MagicMock()
+        mock_resp.status_code = 409
+        with patch.object(api._session, "get", return_value=mock_resp):
+            result = api.test_connection()
+        assert result == "OK"
+
+
+# ── RSSWatcher ────────────────────────────────────────────────────────────────
+
+class TestRSSWatcher:
+    def _make_watcher(self):
+        mock_engine = MagicMock()
+        mock_engine.search.return_value = []
+        return RSSWatcher(mock_engine, interval_min=60)
+
+    def test_add_watch_returns_id(self):
+        w = self._make_watcher()
+        wid = w.add_watch("ubuntu", callback=None)
+        assert len(wid) == 8
+
+    def test_list_watches(self):
+        w = self._make_watcher()
+        w.add_watch("ubuntu", callback=None)
+        w.add_watch("debian", callback=None)
+        watches = w.list_watches()
+        assert len(watches) == 2
+        queries = {x["query"] for x in watches}
+        assert queries == {"ubuntu", "debian"}
+
+    def test_remove_watch(self):
+        w = self._make_watcher()
+        wid = w.add_watch("ubuntu", callback=None)
+        result = w.remove_watch(wid)
+        assert result is True
+        assert len(w.list_watches()) == 0
+
+    def test_remove_unknown_watch(self):
+        w = self._make_watcher()
+        result = w.remove_watch("nonexistent")
+        assert result is False
+
+    def test_stop_without_start(self):
+        w = self._make_watcher()
+        w.stop()  # should not raise
+
+    def test_start_stop(self):
+        w = self._make_watcher()
+        w.start()
+        assert w._running is True
+        w.stop()
+        assert w._running is False
+
+    def test_callback_called_on_new_results(self):
+        t1 = Torrent("a" * 40, "Ubuntu", seeds=100)
+        mock_engine = MagicMock()
+        mock_engine.search.return_value = [t1]
+
+        received = []
+
+        def cb(query, results):
+            received.append((query, results))
+
+        w = RSSWatcher(mock_engine, interval_min=60)
+        wid = w.add_watch("ubuntu", callback=cb)
+        # Force last_check to 0 so poll triggers
+        w._watches[wid]["last_check"] = 0.0
+        # Manually trigger poll
+        w._poll_loop_once()
+        assert len(received) == 1
+        assert received[0][0] == "ubuntu"
+        assert received[0][1][0].name == "Ubuntu"
