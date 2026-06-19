@@ -1,0 +1,14 @@
+[project]
+name = "torrent-suchmaschine"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "requests",
+    "beautifulsoup4",
+    "feedparser",
+    "psutil",
+    "PyQt6",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
