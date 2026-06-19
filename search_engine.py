@@ -297,6 +297,146 @@ CACHE = ResultCache()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SQLITE HISTORY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import sqlite3 as _sqlite3
+
+_HISTORY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS searches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    query TEXT NOT NULL,
+    ts REAL NOT NULL,
+    result_count INTEGER
+);
+CREATE TABLE IF NOT EXISTS results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    query TEXT NOT NULL,
+    infohash TEXT NOT NULL,
+    name TEXT,
+    size INTEGER,
+    seeds INTEGER,
+    leeches INTEGER,
+    source TEXT,
+    ts REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_results_query ON results(query);
+"""
+
+
+class SearchHistory:
+    def __init__(self, db_path: str = "~/.torrent_search.db") -> None:
+        self._path = os.path.expanduser(db_path)
+        self._lock = threading.Lock()
+        self._conn: _sqlite3.Connection = None
+        self._open()
+
+    def _open(self) -> None:
+        try:
+            self._conn = _sqlite3.connect(self._path, check_same_thread=False)
+            self._conn.executescript(_HISTORY_SCHEMA)
+            self._conn.commit()
+        except Exception:
+            self._conn = None
+
+    def record_search(self, query: str, result_count: int) -> None:
+        if not self._conn:
+            return
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "INSERT INTO searches (query, ts, result_count) VALUES (?, ?, ?)",
+                    (query, time.time(), result_count),
+                )
+                self._conn.commit()
+            except Exception:
+                pass
+
+    def save_results(self, query: str, results: list) -> None:
+        if not self._conn:
+            return
+        ts = time.time()
+        rows = [
+            (query, t.infohash, t.name, t.size, t.seeds, t.leeches, t.source, ts)
+            for t in results
+            if t.infohash
+        ]
+        if not rows:
+            return
+        with self._lock:
+            try:
+                # Delete old entries for same query before saving new ones
+                self._conn.execute("DELETE FROM results WHERE query = ?", (query,))
+                self._conn.executemany(
+                    "INSERT INTO results (query, infohash, name, size, seeds, leeches, source, ts) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    rows,
+                )
+                self._conn.commit()
+            except Exception:
+                pass
+
+    def get_recent(self, limit: int = 20) -> list:
+        if not self._conn:
+            return []
+        with self._lock:
+            try:
+                cur = self._conn.execute(
+                    "SELECT query, ts, result_count FROM searches "
+                    "ORDER BY ts DESC LIMIT ?",
+                    (limit,),
+                )
+                return [
+                    {"query": r[0], "ts": r[1], "count": r[2]} for r in cur.fetchall()
+                ]
+            except Exception:
+                return []
+
+    def get_cached(self, query: str, max_age_s: int = 3600):
+        if not self._conn:
+            return None
+        cutoff = time.time() - max_age_s
+        with self._lock:
+            try:
+                cur = self._conn.execute(
+                    "SELECT infohash, name, size, seeds, leeches, source FROM results "
+                    "WHERE query = ? AND ts > ? ORDER BY seeds DESC",
+                    (query, cutoff),
+                )
+                rows = cur.fetchall()
+                if not rows:
+                    return None
+                return [
+                    Torrent(r[0], r[1] or "", r[2] or 0, r[3] or 0, r[4] or 0, r[5] or "")
+                    for r in rows
+                ]
+            except Exception:
+                return None
+
+    def clear(self) -> None:
+        if not self._conn:
+            return
+        with self._lock:
+            try:
+                self._conn.execute("DELETE FROM searches")
+                self._conn.execute("DELETE FROM results")
+                self._conn.commit()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        if self._conn:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
+
+HISTORY = SearchHistory()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # UTILITIES
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -350,28 +490,38 @@ def fetch_text(
             "Referer": random.choice(_REFERERS),
             "Accept-Language": "en-US,en;q=0.9",
         }
-        try:
-            resp = _POOL_SESSION.get(
-                url,
-                headers=headers,
-                proxies=cfg.proxies,
-                stream=True,
-                timeout=timeout,
-                verify=True,
-            )
-            resp.raise_for_status()
-            chunks = []
-            total = 0
-            for chunk in resp.iter_content(chunk_size=4096):
-                if chunk:
-                    chunks.append(chunk)
-                    total += len(chunk)
-                    if total >= max_bytes:
-                        break
-            resp.close()
-            return b"".join(chunks).decode("utf-8", errors="replace")
-        except Exception:
-            return ""
+        last_exc = None
+        for attempt in range(2):
+            try:
+                resp = _POOL_SESSION.get(
+                    url,
+                    headers=headers,
+                    proxies=cfg.proxies,
+                    stream=True,
+                    timeout=timeout,
+                    verify=True,
+                )
+                if resp.status_code in (429, 503) and attempt == 0:
+                    resp.close()
+                    if not cfg.no_delay:
+                        time.sleep(2)
+                    continue
+                resp.raise_for_status()
+                chunks = []
+                total = 0
+                for chunk in resp.iter_content(chunk_size=4096):
+                    if chunk:
+                        chunks.append(chunk)
+                        total += len(chunk)
+                        if total >= max_bytes:
+                            break
+                resp.close()
+                return b"".join(chunks).decode("utf-8", errors="replace")
+            except Exception as exc:
+                last_exc = exc
+                if attempt == 0:
+                    continue
+        return ""
 
 
 def dedup_stream(iterable):
@@ -421,6 +571,125 @@ def _ram_mb() -> float:
         except Exception:
             pass
     return 0.0
+
+
+_SIZE_UNITS = {"kb": 1024, "mb": 1024**2, "gb": 1024**3, "tb": 1024**4}
+
+_FILTER_RE = re.compile(
+    r"""
+    (?P<key>seeds|leeches|size|source)   # field name
+    (?P<op>[<>=])                        # operator
+    (?P<val>\S+)                         # value (no spaces)
+    """,
+    re.VERBOSE | re.IGNORECASE,
+)
+
+
+def parse_filters(raw_query: str) -> tuple:
+    """Split 'ubuntu seeds>50 size<2GB' → ('ubuntu', {'seeds_min':50, 'size_max':2GB_bytes})."""
+    filters: dict = {}
+    clean_parts = []
+    for token in raw_query.split():
+        m = _FILTER_RE.fullmatch(token)
+        if not m:
+            clean_parts.append(token)
+            continue
+        key = m.group("key").lower()
+        op = m.group("op")
+        val_str = m.group("val").lower()
+
+        if key in ("seeds", "leeches"):
+            try:
+                n = int(val_str)
+            except ValueError:
+                clean_parts.append(token)
+                continue
+            suffix = "_min" if op in (">", "=") else "_max"
+            filters[key + suffix] = n
+
+        elif key == "size":
+            unit = 1
+            for unit_str, unit_bytes in _SIZE_UNITS.items():
+                if val_str.endswith(unit_str):
+                    val_str = val_str[: -len(unit_str)]
+                    unit = unit_bytes
+                    break
+            try:
+                n = float(val_str) * unit
+            except ValueError:
+                clean_parts.append(token)
+                continue
+            suffix = "_min" if op in (">", "=") else "_max"
+            filters["size" + suffix] = int(n)
+
+        elif key == "source":
+            if op == "=":
+                filters["source"] = val_str
+
+    return " ".join(clean_parts).strip(), filters
+
+
+def apply_filters(results: list, filters: dict) -> list:
+    """Filter results list according to parsed filter dict."""
+    if not filters:
+        return results
+    out = []
+    for t in results:
+        if "seeds_min" in filters and t.seeds < filters["seeds_min"]:
+            continue
+        if "seeds_max" in filters and t.seeds > filters["seeds_max"]:
+            continue
+        if "leeches_min" in filters and t.leeches < filters["leeches_min"]:
+            continue
+        if "leeches_max" in filters and t.leeches > filters["leeches_max"]:
+            continue
+        if "size_min" in filters and t.size < filters["size_min"]:
+            continue
+        if "size_max" in filters and t.size > filters["size_max"] and t.size > 0:
+            continue
+        if "source" in filters and t.source.lower() != filters["source"]:
+            continue
+        out.append(t)
+    return out
+
+
+def format_results(results: list, fmt: str, cfg: "PrivacyConfig" = None) -> str:
+    """Serialise results to JSON or CSV string."""
+    import json
+    import csv
+    import io
+
+    if fmt == "json":
+        rows = []
+        for t in results:
+            rows.append({
+                "infohash": t.infohash,
+                "name": t.name,
+                "size": t.size,
+                "seeds": t.seeds,
+                "leeches": t.leeches,
+                "source": t.source,
+                "magnet": build_magnet(t, cfg) if cfg else "",
+            })
+        return json.dumps(rows, indent=2, ensure_ascii=False)
+
+    elif fmt == "csv":
+        buf = io.StringIO()
+        fieldnames = ["infohash", "name", "size", "seeds", "leeches", "source"]
+        w = csv.DictWriter(buf, fieldnames=fieldnames, lineterminator="\n")
+        w.writeheader()
+        for t in results:
+            w.writerow({
+                "infohash": t.infohash,
+                "name": t.name,
+                "size": t.size,
+                "seeds": t.seeds,
+                "leeches": t.leeches,
+                "source": t.source,
+            })
+        return buf.getvalue()
+
+    return ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -622,11 +891,23 @@ def _stream_scraping(query: str, cfg: PrivacyConfig):
                         leeches = int(cells[2].get_text(strip=True).replace(",", ""))
                     except ValueError:
                         leeches = 0
-                    # Infohash not directly available in listing; use placeholder
-                    ih_placeholder = re.sub(r"[^a-z0-9]", "", name.lower())[:40].ljust(40, "0")
-                    results.append(Torrent(ih_placeholder, name, 0, seeds, leeches, "1337x"))
-                if results:
-                    return results
+                    results.append((href, name, seeds, leeches))
+                # Fetch detail pages for first 5 results to get real infohash
+                final = []
+                for detail_href, name, seeds, leeches in results[:5]:
+                    ih = ""
+                    try:
+                        detail_url = mirror + detail_href
+                        detail_text = fetch_text(detail_url, cfg, max_bytes=32 * 1024, timeout=10)
+                        m = re.search(r"btih:([0-9a-fA-F]{40})", detail_text, re.I)
+                        if m:
+                            ih = m.group(1)
+                    except Exception:
+                        pass
+                    if ih:
+                        final.append(Torrent(ih, name, 0, seeds, leeches, "1337x"))
+                if final:
+                    return final
             except Exception:
                 continue
         return []
@@ -856,10 +1137,18 @@ class TorrentSearchEngine:
         self._dht: DHTSniffer = None
 
     def search(self, query: str) -> list:
+        # 1. RAM cache (300s)
         cached = CACHE.get(query)
         if cached is not None:
             print(f"  [cache hit] {len(cached)} Ergebnisse")
             return cached
+
+        # 2. SQLite cache (1h)
+        db_cached = HISTORY.get_cached(query, max_age_s=3600)
+        if db_cached:
+            print(f"  [db cache hit] {len(db_cached)} Ergebnisse")
+            CACHE.set(query, db_cached)
+            return db_cached
 
         ram_before = _ram_mb()
 
@@ -917,6 +1206,8 @@ class TorrentSearchEngine:
             print(f"  RAM: {ram_before:.1f}MB → {ram_after:.1f}MB")
 
         CACHE.set(query, results)
+        HISTORY.record_search(query, len(results))
+        HISTORY.save_results(query, results)
         return results
 
     def close(self) -> None:
@@ -995,7 +1286,8 @@ def run_cli(args) -> None:
     if warn:
         print(f"  {warn}")
     print("=" * 60)
-    print("  Befehle: privacy | cache | ram | q")
+    print("  Befehle: privacy | cache | ram | history | history clear | q")
+    print("  Filter-Syntax: 'ubuntu seeds>50 size<2GB source=apibay'")
     print("  Nummer eingeben nach Suche für Magnet-Link\n")
 
     last_results: list = []
@@ -1019,7 +1311,23 @@ def run_cli(args) -> None:
             continue
         if query.lower() == "cache":
             CACHE.clear()
-            print("Cache geleert.")
+            print("RAM-Cache geleert.")
+            continue
+        if query.lower() == "history clear":
+            HISTORY.clear()
+            CACHE.clear()
+            print("Suchverlauf und Cache geleert.")
+            continue
+        if query.lower() == "history":
+            recent = HISTORY.get_recent(limit=20)
+            if not recent:
+                print("  Kein Suchverlauf vorhanden.")
+            else:
+                print(f"\n  Letzte {len(recent)} Suchen:\n")
+                for i, entry in enumerate(recent, 1):
+                    ts_str = time.strftime("%d.%m.%Y %H:%M", time.localtime(entry["ts"]))
+                    print(f"  {i:3d}. {ts_str}  {entry['query']:<40s}  {entry['count'] or 0:4d} Ergebnisse")
+                print()
             continue
         if query.lower() == "ram":
             if HAS_PSUTIL:
@@ -1045,9 +1353,20 @@ def run_cli(args) -> None:
                 print(f"Ungültige Nummer (1–{len(last_results)})")
             continue
 
+        # Parse filters from query
+        clean_query, filters = parse_filters(query)
+        if not clean_query:
+            print("  Bitte einen Suchbegriff eingeben.")
+            continue
+        if filters:
+            active = ", ".join(f"{k}={v}" for k, v in filters.items())
+            print(f"  Filter aktiv: {active}")
+
         # Perform search
-        print(f"\nSuche nach: {query!r}")
-        results = engine.search(query)
+        print(f"\nSuche nach: {clean_query!r}")
+        results = engine.search(clean_query)
+        if filters:
+            results = apply_filters(results, filters)
         last_results = results
 
         if not results:
@@ -1062,6 +1381,7 @@ def run_cli(args) -> None:
         print("\n  (Nummer eingeben für Magnet-Link)\n")
 
     engine.close()
+    HISTORY.close()
 
 
 def main() -> None:
@@ -1101,8 +1421,51 @@ def main() -> None:
         dest="top_k",
         help=f"Maximalanzahl Ergebnisse (Standard: {Platform.TOP_K_DEFAULT})",
     )
+    parser.add_argument(
+        "--query",
+        metavar="SUCHBEGRIFF",
+        default="",
+        help="Suchanfrage für nicht-interaktiven Modus (kombinierbar mit --json/--csv)",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="output_json",
+        help="Ergebnisse als JSON auf stdout ausgeben (nicht-interaktiv)",
+    )
+    parser.add_argument(
+        "--csv",
+        action="store_true",
+        dest="output_csv",
+        help="Ergebnisse als CSV auf stdout ausgeben (nicht-interaktiv)",
+    )
 
     args = parser.parse_args()
+
+    # Non-interactive batch mode
+    if args.query and (args.output_json or args.output_csv):
+        cfg = PrivacyConfig(
+            proxy=args.proxy or "",
+            use_doh=args.doh,
+            no_delay=args.no_delay,
+        )
+        if cfg.use_doh:
+            enable_doh()
+        engine = TorrentSearchEngine(
+            cfg=cfg,
+            dht_seconds=args.dht_sec,
+            top_k=args.top_k or Platform.TOP_K_DEFAULT,
+        )
+        clean_query, filters = parse_filters(args.query)
+        results = engine.search(clean_query)
+        if filters:
+            results = apply_filters(results, filters)
+        fmt = "json" if args.output_json else "csv"
+        print(format_results(results, fmt, cfg))
+        engine.close()
+        HISTORY.close()
+        return
+
     run_cli(args)
 
 

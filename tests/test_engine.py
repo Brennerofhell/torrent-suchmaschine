@@ -15,9 +15,13 @@ from search_engine import (
     Torrent,
     PrivacyConfig,
     ResultCache,
+    SearchHistory,
     top_k_stream,
     dedup_stream,
     fetch_text,
+    parse_filters,
+    apply_filters,
+    format_results,
     DHTSniffer,
     build_magnet,
     _extract_infohash,
@@ -356,3 +360,210 @@ class TestBuildMagnet:
 
 # need os for the DHT test
 import os
+
+
+# ── SearchHistory ─────────────────────────────────────────────────────────────
+
+class TestSearchHistory:
+    def _make_history(self, tmp_path):
+        db = str(tmp_path / "test.db")
+        return SearchHistory(db_path=db)
+
+    def test_record_and_get_recent(self, tmp_path):
+        h = self._make_history(tmp_path)
+        h.record_search("ubuntu", 10)
+        h.record_search("debian", 5)
+        recent = h.get_recent(limit=10)
+        assert len(recent) == 2
+        assert recent[0]["query"] == "debian"  # most recent first
+        assert recent[1]["query"] == "ubuntu"
+        h.close()
+
+    def test_save_and_get_cached(self, tmp_path):
+        h = self._make_history(tmp_path)
+        torrents = [
+            Torrent("a" * 40, "Ubuntu 24.04", seeds=100),
+            Torrent("b" * 40, "Ubuntu Server", seeds=50),
+        ]
+        h.save_results("ubuntu", torrents)
+        result = h.get_cached("ubuntu", max_age_s=3600)
+        assert result is not None
+        assert len(result) == 2
+        assert result[0].seeds == 100
+        h.close()
+
+    def test_sqlite_cache_ttl_expired(self, tmp_path):
+        h = self._make_history(tmp_path)
+        torrents = [Torrent("c" * 40, "OldTorrent", seeds=1)]
+        h.save_results("old", torrents)
+        result = h.get_cached("old", max_age_s=0)  # 0s TTL = already expired
+        assert result is None
+        h.close()
+
+    def test_cache_miss_returns_none(self, tmp_path):
+        h = self._make_history(tmp_path)
+        assert h.get_cached("nonexistent") is None
+        h.close()
+
+    def test_clear(self, tmp_path):
+        h = self._make_history(tmp_path)
+        h.record_search("test", 5)
+        h.save_results("test", [Torrent("d" * 40, "T")])
+        h.clear()
+        assert h.get_recent() == []
+        assert h.get_cached("test") is None
+        h.close()
+
+    def test_empty_infohash_not_saved(self, tmp_path):
+        h = self._make_history(tmp_path)
+        torrents = [Torrent("", "NoHash")]
+        h.save_results("q", torrents)
+        result = h.get_cached("q")
+        assert result is None
+        h.close()
+
+
+# ── parse_filters / apply_filters ─────────────────────────────────────────────
+
+class TestParseFilters:
+    def test_no_filters(self):
+        query, filters = parse_filters("ubuntu linux")
+        assert query == "ubuntu linux"
+        assert filters == {}
+
+    def test_seeds_min(self):
+        query, filters = parse_filters("ubuntu seeds>50")
+        assert query == "ubuntu"
+        assert filters.get("seeds_min") == 50
+
+    def test_seeds_max(self):
+        query, filters = parse_filters("debian seeds<100")
+        assert query == "debian"
+        assert filters.get("seeds_max") == 100
+
+    def test_size_mb(self):
+        query, filters = parse_filters("iso size<500mb")
+        assert query == "iso"
+        assert filters.get("size_max") == 500 * 1024 ** 2
+
+    def test_size_gb(self):
+        query, filters = parse_filters("movie size>2gb")
+        assert query == "movie"
+        assert filters.get("size_min") == 2 * 1024 ** 3
+
+    def test_source_filter(self):
+        query, filters = parse_filters("python source=apibay")
+        assert query == "python"
+        assert filters.get("source") == "apibay"
+
+    def test_multiple_filters(self):
+        query, filters = parse_filters("ubuntu seeds>10 size<2gb source=nyaa")
+        assert query == "ubuntu"
+        assert filters["seeds_min"] == 10
+        assert filters["size_max"] == 2 * 1024 ** 3
+        assert filters["source"] == "nyaa"
+
+    def test_empty_after_filters(self):
+        query, filters = parse_filters("seeds>5")
+        assert query == ""
+        assert filters["seeds_min"] == 5
+
+
+class TestApplyFilters:
+    def _t(self, ih_char, seeds=0, leeches=0, size=0, source="apibay"):
+        return Torrent(ih_char * 40, "T", size, seeds, leeches, source)
+
+    def test_filter_seeds_min(self):
+        results = [self._t("a", seeds=5), self._t("b", seeds=100), self._t("c", seeds=50)]
+        out = apply_filters(results, {"seeds_min": 50})
+        assert len(out) == 2
+        assert all(t.seeds >= 50 for t in out)
+
+    def test_filter_seeds_max(self):
+        results = [self._t("a", seeds=5), self._t("b", seeds=100)]
+        out = apply_filters(results, {"seeds_max": 10})
+        assert len(out) == 1
+
+    def test_filter_source(self):
+        results = [self._t("a", source="apibay"), self._t("b", source="nyaa")]
+        out = apply_filters(results, {"source": "nyaa"})
+        assert len(out) == 1
+        assert out[0].source == "nyaa"
+
+    def test_filter_size_max(self):
+        mb = 1024 * 1024
+        results = [self._t("a", size=100*mb), self._t("b", size=2000*mb)]
+        out = apply_filters(results, {"size_max": 500 * mb})
+        assert len(out) == 1
+
+    def test_no_filters_passthrough(self):
+        results = [self._t("a"), self._t("b"), self._t("c")]
+        assert apply_filters(results, {}) == results
+
+
+# ── format_results ────────────────────────────────────────────────────────────
+
+class TestFormatResults:
+    def _sample(self):
+        return [
+            Torrent("a" * 40, "Ubuntu 24.04", size=1024**3, seeds=500, leeches=50, source="apibay"),
+            Torrent("b" * 40, "Debian 12", size=500*1024**2, seeds=200, leeches=20, source="nyaa"),
+        ]
+
+    def test_json_is_valid(self):
+        import json
+        cfg = PrivacyConfig(no_delay=True)
+        output = format_results(self._sample(), "json", cfg)
+        data = json.loads(output)
+        assert isinstance(data, list)
+        assert len(data) == 2
+        assert data[0]["name"] == "Ubuntu 24.04"
+        assert data[0]["seeds"] == 500
+        assert "magnet" in data[0]
+
+    def test_json_contains_infohash(self):
+        import json
+        cfg = PrivacyConfig(no_delay=True)
+        output = format_results(self._sample(), "json", cfg)
+        data = json.loads(output)
+        assert data[0]["infohash"] == "a" * 40
+
+    def test_csv_has_header(self):
+        output = format_results(self._sample(), "csv")
+        lines = output.strip().split("\n")
+        assert lines[0].startswith("infohash")
+        assert "name" in lines[0]
+        assert "seeds" in lines[0]
+
+    def test_csv_row_count(self):
+        output = format_results(self._sample(), "csv")
+        lines = [l for l in output.strip().split("\n") if l]
+        assert len(lines) == 3  # header + 2 rows
+
+    def test_fetch_text_retry_429(self):
+        """fetch_text should retry once on 429 response."""
+        cfg = PrivacyConfig(no_delay=True)
+        call_count = [0]
+
+        mock_resp_429 = MagicMock()
+        mock_resp_429.status_code = 429
+        mock_resp_429.close = MagicMock()
+
+        mock_resp_ok = MagicMock()
+        mock_resp_ok.status_code = 200
+        mock_resp_ok.raise_for_status = MagicMock()
+        mock_resp_ok.iter_content = MagicMock(return_value=[b"hello world"])
+        mock_resp_ok.close = MagicMock()
+
+        def side_effect(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return mock_resp_429
+            return mock_resp_ok
+
+        with patch("search_engine._POOL_SESSION") as mock_session:
+            mock_session.get.side_effect = side_effect
+            result = fetch_text("http://example.com", cfg)
+
+        assert call_count[0] == 2
+        assert "hello" in result
